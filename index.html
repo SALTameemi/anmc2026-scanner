@@ -23,24 +23,40 @@
        check_in       timestamptz not null default now(),
        check_out      timestamptz,
        cpd_hours      numeric,
-       scanned_by       uuid  default auth.uid(),   -- معرّف المتطوع الذي سجّل الدخول
-       scanned_by_email text  default auth.email(), -- إيميل المتطوع الذي سجّل الدخول
-       check_in_by_email  text,                       -- إيميل من عمل Check-in
-       check_out_by_email text,                       -- إيميل من عمل Check-out
+       scanned_in_by_email  text, -- إيميل من عمل Check-in
+       scanned_out_by_email text, -- إيميل من عمل Check-out
        created_at     timestamptz not null default now()
      );
      create index if not exists idx_attendance_open
        on public.attendance (registrant_code) where check_out is null;
 
-     -- إذا كان جدول attendance موجوداً مسبقاً، شغّل هذه الإضافات مرة واحدة:
-     alter table public.attendance
-       add column if not exists check_in_by_email text,
-       add column if not exists check_out_by_email text;
+     -- MIGRATION: شغّل هذا الجزء مرة واحدة على جدول attendance الحالي
+     -- إذا كنت شغّلت النسخة السابقة، يتم تحويل أسماء الأعمدة القديمة للجديدة.
+     do $$
+     begin
+       if exists (select 1 from information_schema.columns
+                  where table_schema='public' and table_name='attendance' and column_name='check_in_by_email')
+          and not exists (select 1 from information_schema.columns
+                  where table_schema='public' and table_name='attendance' and column_name='scanned_in_by_email') then
+         alter table public.attendance rename column check_in_by_email to scanned_in_by_email;
+       end if;
 
-     -- البيانات القديمة: scanned_by_email كان هو الشخص الذي عمل Check-in
+       if exists (select 1 from information_schema.columns
+                  where table_schema='public' and table_name='attendance' and column_name='check_out_by_email')
+          and not exists (select 1 from information_schema.columns
+                  where table_schema='public' and table_name='attendance' and column_name='scanned_out_by_email') then
+         alter table public.attendance rename column check_out_by_email to scanned_out_by_email;
+       end if;
+     end $$;
+
+     alter table public.attendance
+       add column if not exists scanned_in_by_email text,
+       add column if not exists scanned_out_by_email text;
+
+     -- للبيانات القديمة: scanned_by_email كان هو الشخص الذي عمل Check-in
      update public.attendance
-       set check_in_by_email = scanned_by_email
-       where check_in_by_email is null;
+       set scanned_in_by_email = coalesce(scanned_in_by_email, scanned_by_email)
+       where scanned_in_by_email is null;
 
      -- (ب) جدول ربط المسؤول بمتطوعيه
      create table if not exists public.supervisors (
@@ -59,17 +75,24 @@
      create policy "att_update" on public.attendance
        for update to authenticated using (true);
 
-     -- القراءة: المتطوع يرى ما سجّله هو،
-     -- والمسؤول يرى ما سجّله متطوعوه فقط (فلترة على مستوى القاعدة)
+     -- القراءة: المتطوع يرى ما سجّله في Check-in أو Check-out،
+     -- والمسؤول يرى ما سجّله متطوعوه في أي من العمليتين.
+     drop policy if exists "att_read" on public.attendance;
      create policy "att_read" on public.attendance
        for select to authenticated using (
-         scanned_by_email = auth.email()
+         scanned_in_by_email = auth.email()
+         or scanned_out_by_email = auth.email()
          or exists (
            select 1 from public.supervisors sv
            where sv.supervisor_email = auth.email()
-             and sv.volunteer_email  = attendance.scanned_by_email
+             and (sv.volunteer_email = attendance.scanned_in_by_email
+                  or sv.volunteer_email = attendance.scanned_out_by_email)
          )
        );
+
+     -- بعد التأكد أن كل شيء يعمل، يمكن حذف الأعمدة القديمة:
+     -- alter table public.attendance drop column if exists scanned_by;
+     -- alter table public.attendance drop column if exists scanned_by_email;
 
      -- المسؤول يقرأ صفوف الربط الخاصة به فقط
      create policy "sv_read" on public.supervisors
@@ -363,8 +386,7 @@ async function insertCheckIn(code,name){
     body:JSON.stringify({
       registrant_code:code,
       registrant_name:name,
-      scanned_by_email:S.email,
-      check_in_by_email:S.email
+      scanned_in_by_email:S.email
     })});
   return rows[0];
 }
@@ -374,7 +396,7 @@ async function closeCheckOut(id,checkInISO){
     body:JSON.stringify({
       check_out:outT.toISOString(),
       cpd_hours:hours,
-      check_out_by_email:S.email
+      scanned_out_by_email:S.email
     })});
   return {outT,hours};
 }
@@ -498,16 +520,16 @@ async function exportExcel(){
   btn.textContent='Exporting…'; btn.disabled=true;
   try{
     // بفضل RLS، هذا الاستعلام يرجّع فقط حركات متطوّعي هذا المسؤول
-    const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}?select=*&order=scanned_by_email,check_in`);
+    const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}?select=*&order=scanned_in_by_email,check_in`);
     if(!rows.length){ alert('No activity for your volunteers yet.'); return; }
 
     const data=rows.map(r=>({
-      'Volunteer (check-in by)': r.check_in_by_email || r.scanned_by_email || '',
+      'Check-in by': r.scanned_in_by_email || '',
       'Participant ID': r.registrant_code||'',
       'Participant name': r.registrant_name||'',
       'Check-in': r.check_in?new Date(r.check_in).toLocaleString('en-GB'):'',
       'Check-out': r.check_out?new Date(r.check_out).toLocaleString('en-GB'):'',
-      'Check-out by': r.check_out_by_email||'',
+      'Check-out by': r.scanned_out_by_email||'',
       'CPD hours': r.cpd_hours!=null ? formatDuration(r.cpd_hours) : ''
     }));
 
@@ -558,7 +580,7 @@ async function fullReport(){
   try{
     // 1) كل الحضور + من عمل Check-in و Check-out
     const att=await fetchAllPaged(
-      `${CONFIG.ATTENDANCE_TABLE}?select=registrant_code,registrant_name,check_in,check_out,cpd_hours,check_in_by_email,check_out_by_email,scanned_by_email&order=registrant_code,check_in`
+      `${CONFIG.ATTENDANCE_TABLE}?select=registrant_code,registrant_name,check_in,check_out,cpd_hours,scanned_in_by_email,scanned_out_by_email&order=registrant_code,check_in`
     );
 
     // 2) كل التسجيل
@@ -598,7 +620,7 @@ async function fullReport(){
 
         if(!agg[c].firstIn || t<agg[c].firstIn){
           agg[c].firstIn=t;
-          agg[c].checkInBy=a.check_in_by_email || a.scanned_by_email || '';
+          agg[c].checkInBy=a.scanned_in_by_email || '';
         }
       }
 
@@ -608,7 +630,7 @@ async function fullReport(){
 
         if(!agg[c].lastOut || t>agg[c].lastOut){
           agg[c].lastOut=t;
-          agg[c].checkOutBy=a.check_out_by_email || '';
+          agg[c].checkOutBy=a.scanned_out_by_email || '';
         }
       }
     });

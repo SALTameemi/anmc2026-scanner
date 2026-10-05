@@ -190,6 +190,7 @@
     <div class="who">
       <div id="whoEmail"></div>
       <button id="exportBtn" class="hidden">Export Excel</button>
+      <button id="fullReportBtn" class="hidden">Full Report</button>
       <button id="logoutBtn">Sign out</button>
     </div>
   </header>
@@ -262,7 +263,7 @@ const CONFIG = {
 const S = {
   configured: !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_ANON_KEY),
   token:null, email:null,
-  scanning:false, lastCode:null, lastAt:0, busy:false, isSupervisor:false
+  scanning:false, lastCode:null, lastAt:0, busy:false, isSupervisor:false, isGlobalAdmin:false
 };
 const $ = id => document.getElementById(id);
 const nowStr = d => new Intl.DateTimeFormat('en-GB',{hour:'2-digit',minute:'2-digit',hour12:true}).format(d);
@@ -311,6 +312,12 @@ async function checkSupervisor(){
     S.isSupervisor = rows.length>0;
     $('exportBtn').classList.toggle('hidden', !S.isSupervisor);
   }catch(e){ console.warn('checkSupervisor',e); }
+  // المسؤول العام فقط يشوف زر التقرير الكامل
+  try{
+    const ga=await sb(`global_admins?email=eq.${encodeURIComponent(S.email)}&select=email`);
+    S.isGlobalAdmin = ga.length>0;
+    $('fullReportBtn').classList.toggle('hidden', !S.isGlobalAdmin);
+  }catch(e){ console.warn('checkGlobalAdmin',e); }
 }
 
 /* ---------- Supabase REST (بتوكن المتطوع) ---------- */
@@ -365,14 +372,20 @@ async function handleCode(raw){
   if(S.busy) return;
   S.lastCode=code; S.lastAt=t; S.busy=true;
   try{
-    const open=await getOpenSession(code);
-    if(!open){
-      const name=await lookupName(code)||code;
-      const row=await insertCheckIn(code,name);
-      showResult('in',name,code,new Date(row?.check_in||Date.now()));
+    // نجيب الاسم (لو تسجيل دخول) ثم نستدعي الدالة التي تقرّر دخول/خروج
+    // بناءً على آخر حركة للمشارك نفسه (أيًّا كان المتطوّع الذي سجّل الدخول)
+    const name=await lookupName(code)||code;
+    const res=await sb('rpc/scan_attendance',{method:'POST',
+      headers:{'Content-Type':'application/json',Prefer:'return=representation'},
+      body:JSON.stringify({p_code:code,p_name:name})});
+    const r=Array.isArray(res)?res[0]:res;
+    if(r && r.error){ throw new Error(r.error); }
+    if(r && r.action==='in'){
+      showResult('in', r.name||name, code, new Date(r.check_in||Date.now()));
+    }else if(r && r.action==='out'){
+      showResult('out', r.name||code, code, new Date(r.check_out||Date.now()), r.hours);
     }else{
-      const {outT,hours}=await closeCheckOut(open.id,open.check_in);
-      showResult('out',open.registrant_name||code,code,outT,hours);
+      throw new Error('unexpected response');
     }
     refreshStats(); beep();
   }catch(e){
@@ -475,6 +488,97 @@ async function exportExcel(){
     console.error(e); alert('Export failed: '+e.message);
   }finally{ btn.textContent=old; btn.disabled=false; }
 }
+
+/* ---------- التقرير الكامل: Excel بـ6 شيتات بالفئة ---------- */
+$('fullReportBtn').addEventListener('click', fullReport);
+
+const CONF_TOTAL_HOURS = 25;   // إجمالي ساعات المؤتمر
+const FULL_POINTS       = 17;  // نقاط CPD الكاملة
+
+function roundHalf(x){ return Math.round(x*2)/2; }
+
+async function fetchAllPaged(pathBase){
+  // نسحب كل الصفوف على دفعات (تجاوز حد الصفوف الافتراضي)
+  const out=[]; const step=1000; let from=0;
+  while(true){
+    const rows=await sb(pathBase, {headers:{Range:`${from}-${from+step-1}`, 'Range-Unit':'items'}});
+    if(!rows.length) break;
+    out.push(...rows);
+    if(rows.length<step) break;
+    from+=step;
+  }
+  return out;
+}
+
+async function fullReport(){
+  const btn=$('fullReportBtn'); const old=btn.textContent;
+  btn.textContent='Building…'; btn.disabled=true;
+  try{
+    // 1) كل الحضور
+    const att=await fetchAllPaged(`${CONFIG.ATTENDANCE_TABLE}?select=registrant_code,registrant_name,check_in,check_out,cpd_hours&order=registrant_code,check_in`);
+    // 2) كل التسجيل (الفئة/QID/License/الإيميل/نوع الحضور)
+    const reg=await fetchAllPaged(`${CONFIG.REG_TABLE}?select=registrant_id,full_name,qid,licence_no,email,category,attendance_mode`);
+    if(!reg.length){ alert('No registrations found.'); return; }
+
+    // خريطة التسجيل بالمعرّف
+    const regMap={}; reg.forEach(r=> regMap[r.registrant_id]=r);
+
+    // 3) نجمّع حضور كل مشارك (إجمالي الساعات + أول دخول + آخر خروج)
+    const agg={}; // code -> {hours, firstIn, lastOut, name}
+    att.forEach(a=>{
+      const c=a.registrant_code; if(!c) return;
+      if(!agg[c]) agg[c]={hours:0, firstIn:null, lastOut:null, name:a.registrant_name||''};
+      const h=parseFloat(a.cpd_hours); if(!isNaN(h)) agg[c].hours+=h;
+      if(a.check_in){ const t=new Date(a.check_in); if(!agg[c].firstIn||t<agg[c].firstIn) agg[c].firstIn=t; }
+      if(a.check_out){ const t=new Date(a.check_out); if(!agg[c].lastOut||t>agg[c].lastOut) agg[c].lastOut=t; }
+    });
+
+    const fmt=d=> d? d.toLocaleString('en-GB'):'';
+
+    // 4) نبني صفوف لكل مشارك مسجّل، مع حضوره (لو موجود)
+    const CATS=['Participant','Speaker','Member','Guest','Complimentary'];
+    const buckets={}; CATS.forEach(c=>buckets[c]=[]); buckets['Online']=[];
+
+    reg.forEach(r=>{
+      const a=agg[r.registrant_id];
+      const hours=a? +a.hours.toFixed(3):0;
+      const licensed = r.licence_no && String(r.licence_no).trim()!=='';
+      const points = licensed && hours>0 ? roundHalf((hours/CONF_TOTAL_HOURS)*FULL_POINTS) : (licensed? 0 : '');
+      const row={
+        'Name': r.full_name||a?.name||'',
+        'QID': r.qid||'',
+        'License': licensed? r.licence_no : 'NA',
+        'Email': r.email||'',
+        'Check-in': a? fmt(a.firstIn):'',
+        'Check-out': a? fmt(a.lastOut):'',
+        'Total hours': hours||0,
+        'CPD points': points
+      };
+      // أونلاين → شيت Online ، غيره → شيت فئته
+      if(r.attendance_mode==='online') buckets['Online'].push(row);
+      else (buckets[r.category]||buckets['Participant']).push(row);
+    });
+
+    // 5) نبني الملف
+    const wb=XLSX.utils.book_new();
+    const cols=[{wch:26},{wch:14},{wch:14},{wch:26},{wch:20},{wch:20},{wch:11},{wch:11}];
+    const HEADERS=['Name','QID','License','Email','Check-in','Check-out','Total hours','CPD points'];
+    const order=['Participant','Speaker','Member','Guest','Complimentary','Online'];
+    order.forEach(cat=>{
+      const data=buckets[cat];
+      let ws;
+      if(data.length){ ws=XLSX.utils.json_to_sheet(data, {header:HEADERS}); }
+      else { ws=XLSX.utils.aoa_to_sheet([HEADERS]); }  // شيت فاضي بكل العناوين
+      ws['!cols']=cols;
+      XLSX.utils.book_append_sheet(wb, ws, cat);
+    });
+    const stamp=new Date().toISOString().slice(0,10);
+    XLSX.writeFile(wb,`ANMC2026-FULL-REPORT-${stamp}.xlsx`);
+  }catch(e){
+    console.error(e); alert('Full report failed: '+e.message);
+  }finally{ btn.textContent=old; btn.disabled=false; }
+}
+
 $('startBtn').addEventListener('click', startCamera);
 $('manualBtn').addEventListener('click', ()=>{const v=$('manualCode').value.trim();if(!v)return;handleCode(v);$('manualCode').value='';});
 $('manualCode').addEventListener('keydown',e=>{if(e.key==='Enter')$('manualBtn').click();});

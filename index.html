@@ -555,10 +555,13 @@ async function exportExcel(){
 /* ---------- التقرير الكامل: Excel بـ6 شيتات بالفئة ---------- */
 $('fullReportBtn').addEventListener('click', fullReport);
 
-const CONF_TOTAL_HOURS = 25;   // إجمالي ساعات المؤتمر
-const FULL_POINTS       = 17;  // نقاط CPD الكاملة
+const CONF_TOTAL_HOURS = 16.5; // الحد الأقصى لساعات CPD المحتسبة
+const FULL_POINTS      = 16.5; // كل ساعة حضور = 1 CPD point
 
-function roundHalf(x){ return Math.round(x*2)/2; }
+function calculateCPD(hours){
+  const h = Number(hours) || 0;
+  return Math.min(Math.max(h, 0), FULL_POINTS);
+}
 
 async function fetchAllPaged(pathBase){
   // نسحب كل الصفوف على دفعات (تجاوز حد الصفوف الافتراضي)
@@ -662,9 +665,9 @@ async function fullReport(){
         String(r.licence_no).trim()!=='';
 
       const points=
-        licensed && hours>0
-          ? roundHalf((hours/CONF_TOTAL_HOURS)*FULL_POINTS)
-          : (licensed ? 0 : '');
+        licensed
+          ? Number(calculateCPD(hours).toFixed(2))
+          : '';
 
       const row={
         'Name':r.full_name||a?.name||'',

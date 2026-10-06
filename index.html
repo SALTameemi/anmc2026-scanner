@@ -372,14 +372,19 @@ async function handleCode(raw){
   if(S.busy) return;
   S.lastCode=code; S.lastAt=t; S.busy=true;
   try{
-    const open=await getOpenSession(code);
-    if(!open){
-      const name=await lookupName(code)||code;
-      const row=await insertCheckIn(code,name);
-      showResult('in',name,code,new Date(row?.check_in||Date.now()));
+    // الدالة تقرّر دخول/خروج بناءً على آخر حركة للمشارك نفسه (تتجاوز RLS)
+    const name=await lookupName(code)||code;
+    const res=await sb('rpc/scan_attendance',{method:'POST',
+      headers:{'Content-Type':'application/json',Prefer:'return=representation'},
+      body:JSON.stringify({p_code:code,p_name:name})});
+    const r=Array.isArray(res)?res[0]:res;
+    if(r && r.error){ throw new Error(r.error); }
+    if(r && r.action==='in'){
+      showResult('in', r.name||name, code, new Date(r.check_in||Date.now()));
+    }else if(r && r.action==='out'){
+      showResult('out', r.name||code, code, new Date(r.check_out||Date.now()), r.hours);
     }else{
-      const {outT,hours}=await closeCheckOut(open.id,open.check_in);
-      showResult('out',open.registrant_name||code,code,outT,hours);
+      throw new Error('unexpected response');
     }
     refreshStats(); beep();
   }catch(e){

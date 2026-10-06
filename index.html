@@ -23,40 +23,12 @@
        check_in       timestamptz not null default now(),
        check_out      timestamptz,
        cpd_hours      numeric,
-       scanned_in_by_email  text, -- إيميل من عمل Check-in
-       scanned_out_by_email text, -- إيميل من عمل Check-out
+       scanned_by       uuid  default auth.uid(),   -- معرّف المتطوع الذي سجّل
+       scanned_by_email text  default auth.email(), -- إيميل المتطوع الذي سجّل
        created_at     timestamptz not null default now()
      );
      create index if not exists idx_attendance_open
        on public.attendance (registrant_code) where check_out is null;
-
-     -- MIGRATION: شغّل هذا الجزء مرة واحدة على جدول attendance الحالي
-     -- إذا كنت شغّلت النسخة السابقة، يتم تحويل أسماء الأعمدة القديمة للجديدة.
-     do $$
-     begin
-       if exists (select 1 from information_schema.columns
-                  where table_schema='public' and table_name='attendance' and column_name='check_in_by_email')
-          and not exists (select 1 from information_schema.columns
-                  where table_schema='public' and table_name='attendance' and column_name='scanned_in_by_email') then
-         alter table public.attendance rename column check_in_by_email to scanned_in_by_email;
-       end if;
-
-       if exists (select 1 from information_schema.columns
-                  where table_schema='public' and table_name='attendance' and column_name='check_out_by_email')
-          and not exists (select 1 from information_schema.columns
-                  where table_schema='public' and table_name='attendance' and column_name='scanned_out_by_email') then
-         alter table public.attendance rename column check_out_by_email to scanned_out_by_email;
-       end if;
-     end $$;
-
-     alter table public.attendance
-       add column if not exists scanned_in_by_email text,
-       add column if not exists scanned_out_by_email text;
-
-     -- للبيانات القديمة: scanned_by_email كان هو الشخص الذي عمل Check-in
-     update public.attendance
-       set scanned_in_by_email = coalesce(scanned_in_by_email, scanned_by_email)
-       where scanned_in_by_email is null;
 
      -- (ب) جدول ربط المسؤول بمتطوعيه
      create table if not exists public.supervisors (
@@ -75,24 +47,17 @@
      create policy "att_update" on public.attendance
        for update to authenticated using (true);
 
-     -- القراءة: المتطوع يرى ما سجّله في Check-in أو Check-out،
-     -- والمسؤول يرى ما سجّله متطوعوه في أي من العمليتين.
-     drop policy if exists "att_read" on public.attendance;
+     -- القراءة: المتطوع يرى ما سجّله هو،
+     -- والمسؤول يرى ما سجّله متطوعوه فقط (فلترة على مستوى القاعدة)
      create policy "att_read" on public.attendance
        for select to authenticated using (
-         scanned_in_by_email = auth.email()
-         or scanned_out_by_email = auth.email()
+         scanned_by_email = auth.email()
          or exists (
            select 1 from public.supervisors sv
            where sv.supervisor_email = auth.email()
-             and (sv.volunteer_email = attendance.scanned_in_by_email
-                  or sv.volunteer_email = attendance.scanned_out_by_email)
+             and sv.volunteer_email  = attendance.scanned_by_email
          )
        );
-
-     -- بعد التأكد أن كل شيء يعمل، يمكن حذف الأعمدة القديمة:
-     -- alter table public.attendance drop column if exists scanned_by;
-     -- alter table public.attendance drop column if exists scanned_by_email;
 
      -- المسؤول يقرأ صفوف الربط الخاصة به فقط
      create policy "sv_read" on public.supervisors
@@ -383,21 +348,13 @@ async function getOpenSession(code){
 }
 async function insertCheckIn(code,name){
   const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}`,{method:'POST',headers:{Prefer:'return=representation'},
-    body:JSON.stringify({
-      registrant_code:code,
-      registrant_name:name,
-      scanned_in_by_email:S.email
-    })});
+    body:JSON.stringify({registrant_code:code,registrant_name:name,scanned_in_by_email:S.email})});
   return rows[0];
 }
 async function closeCheckOut(id,checkInISO){
   const outT=new Date(), hours=+(((outT-new Date(checkInISO))/3600000).toFixed(3));
   await sb(`${CONFIG.ATTENDANCE_TABLE}?id=eq.${id}`,{method:'PATCH',
-    body:JSON.stringify({
-      check_out:outT.toISOString(),
-      cpd_hours:hours,
-      scanned_out_by_email:S.email
-    })});
+    body:JSON.stringify({check_out:outT.toISOString(),cpd_hours:hours,scanned_out_by_email:S.email})});
   return {outT,hours};
 }
 
@@ -415,20 +372,14 @@ async function handleCode(raw){
   if(S.busy) return;
   S.lastCode=code; S.lastAt=t; S.busy=true;
   try{
-    // نجيب الاسم (لو تسجيل دخول) ثم نستدعي الدالة التي تقرّر دخول/خروج
-    // بناءً على آخر حركة للمشارك نفسه (أيًّا كان المتطوّع الذي سجّل الدخول)
-    const name=await lookupName(code)||code;
-    const res=await sb('rpc/scan_attendance',{method:'POST',
-      headers:{'Content-Type':'application/json',Prefer:'return=representation'},
-      body:JSON.stringify({p_code:code,p_name:name})});
-    const r=Array.isArray(res)?res[0]:res;
-    if(r && r.error){ throw new Error(r.error); }
-    if(r && r.action==='in'){
-      showResult('in', r.name||name, code, new Date(r.check_in||Date.now()));
-    }else if(r && r.action==='out'){
-      showResult('out', r.name||code, code, new Date(r.check_out||Date.now()), r.hours);
+    const open=await getOpenSession(code);
+    if(!open){
+      const name=await lookupName(code)||code;
+      const row=await insertCheckIn(code,name);
+      showResult('in',name,code,new Date(row?.check_in||Date.now()));
     }else{
-      throw new Error('unexpected response');
+      const {outT,hours}=await closeCheckOut(open.id,open.check_in);
+      showResult('out',open.registrant_name||code,code,outT,hours);
     }
     refreshStats(); beep();
   }catch(e){
@@ -437,20 +388,11 @@ async function handleCode(raw){
 }
 
 /* ---------- الواجهة ---------- */
-function formatDuration(decimalHours){
-  if(decimalHours==null || isNaN(decimalHours)) return '';
-  const totalSeconds=Math.round(Number(decimalHours)*3600);
-  const h=Math.floor(totalSeconds/3600);
-  const m=Math.floor((totalSeconds%3600)/60);
-  const s=totalSeconds%60;
-  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-}
-
 function showResult(kind,name,code,when,hours=null){
   const r=$('result'); r.className='result '+kind;
   const tags={in:'Checked in',out:'Checked out',err:'Error'};
   let meta=`${code} · ${nowStr(when)}`;
-  if(kind==='out'&&hours!=null) meta+=` · ${formatDuration(hours)}`;
+  if(kind==='out'&&hours!=null) meta+=` · ${hours} h`;
   r.innerHTML=`<span class="tag">${tags[kind]}</span>
     <span class="name">${escapeHtml(name)}</span>
     <span class="meta">${escapeHtml(meta)}</span>`;
@@ -520,48 +462,35 @@ async function exportExcel(){
   btn.textContent='Exporting…'; btn.disabled=true;
   try{
     // بفضل RLS، هذا الاستعلام يرجّع فقط حركات متطوّعي هذا المسؤول
-    const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}?select=*&order=scanned_in_by_email,check_in`);
+    const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}?select=*&order=registrant_code,check_in`);
     if(!rows.length){ alert('No activity for your volunteers yet.'); return; }
-
     const data=rows.map(r=>({
-      'Check-in by': r.scanned_in_by_email || '',
+      'Checked in by': r.scanned_in_by_email||'',
+      'Checked out by': r.scanned_out_by_email||'',
       'Participant ID': r.registrant_code||'',
       'Participant name': r.registrant_name||'',
       'Check-in': r.check_in?new Date(r.check_in).toLocaleString('en-GB'):'',
       'Check-out': r.check_out?new Date(r.check_out).toLocaleString('en-GB'):'',
-      'Check-out by': r.scanned_out_by_email||'',
-      'CPD hours': r.cpd_hours!=null ? formatDuration(r.cpd_hours) : ''
+      'CPD hours': r.cpd_hours??''
     }));
-
     const ws=XLSX.utils.json_to_sheet(data);
-    ws['!cols']=[
-      {wch:28},{wch:16},{wch:24},{wch:22},
-      {wch:22},{wch:28},{wch:14}
-    ];
-
+    ws['!cols']=[{wch:26},{wch:16},{wch:24},{wch:22},{wch:22},{wch:10}];
     const wb=XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb,ws,'Attendance');
-
     const stamp=new Date().toISOString().slice(0,10);
     XLSX.writeFile(wb,`ANMC2026-attendance-${stamp}.xlsx`);
-
   }catch(e){
     console.error(e); alert('Export failed: '+e.message);
-  }finally{
-    btn.textContent=old; btn.disabled=false;
-  }
+  }finally{ btn.textContent=old; btn.disabled=false; }
 }
 
 /* ---------- التقرير الكامل: Excel بـ6 شيتات بالفئة ---------- */
 $('fullReportBtn').addEventListener('click', fullReport);
 
-const CONF_TOTAL_HOURS = 16.5; // الحد الأقصى لساعات CPD المحتسبة
-const FULL_POINTS      = 16.5; // كل ساعة حضور = 1 CPD point
+const CONF_TOTAL_HOURS = 25;   // إجمالي ساعات المؤتمر
+const FULL_POINTS       = 17;  // نقاط CPD الكاملة
 
-function calculateCPD(hours){
-  const h = Number(hours) || 0;
-  return Math.min(Math.max(h, 0), FULL_POINTS);
-}
+function roundHalf(x){ return Math.round(x*2)/2; }
 
 async function fetchAllPaged(pathBase){
   // نسحب كل الصفوف على دفعات (تجاوز حد الصفوف الافتراضي)
@@ -579,191 +508,70 @@ async function fetchAllPaged(pathBase){
 async function fullReport(){
   const btn=$('fullReportBtn'); const old=btn.textContent;
   btn.textContent='Building…'; btn.disabled=true;
-
   try{
-    // 1) كل الحضور + من عمل Check-in و Check-out
-    const att=await fetchAllPaged(
-      `${CONFIG.ATTENDANCE_TABLE}?select=registrant_code,registrant_name,check_in,check_out,cpd_hours,scanned_in_by_email,scanned_out_by_email&order=registrant_code,check_in`
-    );
+    // 1) كل الحضور
+    const att=await fetchAllPaged(`${CONFIG.ATTENDANCE_TABLE}?select=registrant_code,registrant_name,check_in,check_out,cpd_hours&order=registrant_code,check_in`);
+    // 2) كل التسجيل (الفئة/QID/License/الإيميل/نوع الحضور)
+    const reg=await fetchAllPaged(`${CONFIG.REG_TABLE}?select=registrant_id,full_name,qid,licence_no,email,category,attendance_mode`);
+    if(!reg.length){ alert('No registrations found.'); return; }
 
-    // 2) كل التسجيل
-    const reg=await fetchAllPaged(
-      `${CONFIG.REG_TABLE}?select=registrant_id,full_name,qid,licence_no,email,category,attendance_mode`
-    );
+    // خريطة التسجيل بالمعرّف
+    const regMap={}; reg.forEach(r=> regMap[r.registrant_id]=r);
 
-    if(!reg.length){
-      alert('No registrations found.');
-      return;
-    }
-
-    // 3) تجميع حضور كل مشارك
-    const agg={};
-
+    // 3) نجمّع حضور كل مشارك (إجمالي الساعات + أول دخول + آخر خروج)
+    const agg={}; // code -> {hours, firstIn, lastOut, name}
     att.forEach(a=>{
-      const c=a.registrant_code;
-      if(!c) return;
-
-      if(!agg[c]){
-        agg[c]={
-          hours:0,
-          firstIn:null,
-          lastOut:null,
-          name:a.registrant_name||'',
-          checkInBy:'',
-          checkOutBy:''
-        };
-      }
-
-      const h=parseFloat(a.cpd_hours);
-      if(!isNaN(h)) agg[c].hours+=h;
-
-      // أول Check-in + الشخص الذي عمله
-      if(a.check_in){
-        const t=new Date(a.check_in);
-
-        if(!agg[c].firstIn || t<agg[c].firstIn){
-          agg[c].firstIn=t;
-          agg[c].checkInBy=a.scanned_in_by_email || '';
-        }
-      }
-
-      // آخر Check-out + الشخص الذي عمله
-      if(a.check_out){
-        const t=new Date(a.check_out);
-
-        if(!agg[c].lastOut || t>agg[c].lastOut){
-          agg[c].lastOut=t;
-          agg[c].checkOutBy=a.scanned_out_by_email || '';
-        }
-      }
+      const c=a.registrant_code; if(!c) return;
+      if(!agg[c]) agg[c]={hours:0, firstIn:null, lastOut:null, name:a.registrant_name||''};
+      const h=parseFloat(a.cpd_hours); if(!isNaN(h)) agg[c].hours+=h;
+      if(a.check_in){ const t=new Date(a.check_in); if(!agg[c].firstIn||t<agg[c].firstIn) agg[c].firstIn=t; }
+      if(a.check_out){ const t=new Date(a.check_out); if(!agg[c].lastOut||t>agg[c].lastOut) agg[c].lastOut=t; }
     });
 
-    const fmt=d=>d ? d.toLocaleString('en-GB') : '';
+    const fmt=d=> d? d.toLocaleString('en-GB'):'';
 
-    // 4) الفئات
-    const CATS=[
-      'Participant',
-      'Speaker',
-      'Member',
-      'Guest',
-      'Complimentary'
-    ];
+    // 4) نبني صفوف لكل مشارك مسجّل، مع حضوره (لو موجود)
+    const CATS=['Participant','Speaker','Member','Guest','Complimentary'];
+    const buckets={}; CATS.forEach(c=>buckets[c]=[]); buckets['Online']=[];
 
-    const buckets={};
-    CATS.forEach(c=>buckets[c]=[]);
-    buckets['Online']=[];
-
-    // 5) بناء صفوف التقرير
     reg.forEach(r=>{
       const a=agg[r.registrant_id];
-
-      // نحتفظ بالساعات كرقم للحساب، لكن نعرضها HH:MM:SS
-      const hours=a ? +a.hours.toFixed(3) : 0;
-
-      const licensed=
-        r.licence_no &&
-        String(r.licence_no).trim()!=='';
-
-      const points=
-        licensed
-          ? Number(calculateCPD(hours).toFixed(2))
-          : '';
-
+      const hours=a? +a.hours.toFixed(3):0;
+      const licensed = r.licence_no && String(r.licence_no).trim()!=='';
+      const points = licensed && hours>0 ? roundHalf((hours/CONF_TOTAL_HOURS)*FULL_POINTS) : (licensed? 0 : '');
       const row={
-        'Name':r.full_name||a?.name||'',
-        'QID':r.qid||'',
-        'License':licensed ? r.licence_no : 'NA',
-        'Email':r.email||'',
-
-        'Check-in':a ? fmt(a.firstIn) : '',
-        'Check-in by':a ? a.checkInBy : '',
-
-        'Check-out':a ? fmt(a.lastOut) : '',
-        'Check-out by':a ? a.checkOutBy : '',
-
-        'Total hours':formatDuration(hours),
-        'CPD points':points
+        'Name': r.full_name||a?.name||'',
+        'QID': r.qid||'',
+        'License': licensed? r.licence_no : 'NA',
+        'Email': r.email||'',
+        'Check-in': a? fmt(a.firstIn):'',
+        'Check-out': a? fmt(a.lastOut):'',
+        'Total hours': hours||0,
+        'CPD points': points
       };
-
-      if(r.attendance_mode==='online'){
-        buckets['Online'].push(row);
-      }else{
-        (buckets[r.category]||buckets['Participant']).push(row);
-      }
+      // أونلاين → شيت Online ، غيره → شيت فئته
+      if(r.attendance_mode==='online') buckets['Online'].push(row);
+      else (buckets[r.category]||buckets['Participant']).push(row);
     });
 
-    // 6) إنشاء ملف Excel
+    // 5) نبني الملف
     const wb=XLSX.utils.book_new();
-
-    const cols=[
-      {wch:26},{wch:14},{wch:14},{wch:26},
-      {wch:20},{wch:28},{wch:20},{wch:28},
-      {wch:14},{wch:11}
-    ];
-
-    const HEADERS=[
-      'Name',
-      'QID',
-      'License',
-      'Email',
-      'Check-in',
-      'Check-in by',
-      'Check-out',
-      'Check-out by',
-      'Total hours',
-      'CPD points'
-    ];
-
-    const order=[
-      'Participant',
-      'Speaker',
-      'Member',
-      'Guest',
-      'Complimentary',
-      'Online'
-    ];
-
+    const cols=[{wch:26},{wch:14},{wch:14},{wch:26},{wch:20},{wch:20},{wch:11},{wch:11}];
+    const HEADERS=['Name','QID','License','Email','Check-in','Check-out','Total hours','CPD points'];
+    const order=['Participant','Speaker','Member','Guest','Complimentary','Online'];
     order.forEach(cat=>{
       const data=buckets[cat];
-
       let ws;
-
-      if(data.length){
-        ws=XLSX.utils.json_to_sheet(
-          data,
-          {header:HEADERS}
-        );
-      }else{
-        ws=XLSX.utils.aoa_to_sheet([HEADERS]);
-      }
-
+      if(data.length){ ws=XLSX.utils.json_to_sheet(data, {header:HEADERS}); }
+      else { ws=XLSX.utils.aoa_to_sheet([HEADERS]); }  // شيت فاضي بكل العناوين
       ws['!cols']=cols;
-
-      XLSX.utils.book_append_sheet(
-        wb,
-        ws,
-        cat
-      );
+      XLSX.utils.book_append_sheet(wb, ws, cat);
     });
-
     const stamp=new Date().toISOString().slice(0,10);
-
-    XLSX.writeFile(
-      wb,
-      `ANMC2026-FULL-REPORT-${stamp}.xlsx`
-    );
-
+    XLSX.writeFile(wb,`ANMC2026-FULL-REPORT-${stamp}.xlsx`);
   }catch(e){
-
-    console.error(e);
-    alert('Full report failed: '+e.message);
-
-  }finally{
-
-    btn.textContent=old;
-    btn.disabled=false;
-
-  }
+    console.error(e); alert('Full report failed: '+e.message);
+  }finally{ btn.textContent=old; btn.disabled=false; }
 }
 
 $('startBtn').addEventListener('click', startCamera);

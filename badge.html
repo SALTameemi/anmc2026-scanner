@@ -1,7 +1,7 @@
 <!doctype html>
-<html lang="ar" dir="rtl"><head>
+<html lang="en" dir="ltr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>ANMC 2026 — استلام البادج</title>
+<title>ANMC 2026 — Badge Collection</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
 <style>
   :root{--navy:#12356b;--ok:#0a7d33;--warn:#b26a00;--red:#c0392b;--line:#2E3440;}
@@ -27,61 +27,56 @@
   .r-ok{background:#0e3d20;border:2px solid var(--ok)}
   .r-already{background:#4a3410;border:2px solid var(--warn)}
   .r-no{background:#4a1515;border:2px solid var(--red)}
-  .stats{display:flex;gap:10px;margin-bottom:14px}
-  .stat{flex:1;background:#1a1f29;border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
-  .stat b{display:block;font-size:26px;color:#7fd6a0}
-  .stat span{font-size:11px;color:#9AA4B2}
+  .prog .ptop{font-size:15px;text-align:center;margin-bottom:10px}
+  .prog .ptop b{color:#7fd6a0;font-size:20px}
+  .prog .bar{height:18px;background:#232a36;border-radius:10px;overflow:hidden}
+  .prog .fill{height:100%;width:0;background:linear-gradient(90deg,#0a7d33,#3ac07a);transition:width .5s ease}
+  .prog .pbot{font-size:12.5px;color:#9AA4B2;text-align:center;margin-top:9px}
+  .prog .pbot b{color:#fff}
+  .prog .cheer{text-align:center;font-weight:800;color:#7fd6a0;margin-top:8px;min-height:20px;font-size:14px}
   .manual{display:flex;gap:8px}.manual input{margin:0}.manual button{width:auto;padding:12px 16px}
   .hidden{display:none!important}
   .muted{color:#9AA4B2;font-size:12px;text-align:center;margin-top:6px}
 </style></head>
 <body>
 <header>
-  <h1>ANMC 2026 — استلام البادج</h1>
+  <h1>ANMC 2026 — Badge Collection</h1>
   <p>Badge Collection Scanner</p>
 </header>
 
 <div class="wrap">
 
-  <!-- LOGIN -->
-  <div class="card" id="loginCard">
-    <input id="email" type="email" value="badgedesk@anmc2026.qa" autocomplete="username">
-    <input id="pass" type="password" placeholder="كلمة السر" autocomplete="current-password">
-    <button id="loginBtn">تسجيل الدخول</button>
-    <div class="err" id="loginErr"></div>
-  </div>
-
-  <!-- SCANNER -->
-  <div id="scanPane" class="hidden">
+  <!-- SCANNER (no login — opens directly) -->
+  <div id="scanPane">
     <div class="card" id="whoCard">
-      <label style="display:block;font-size:12px;color:#9AA4B2;margin-bottom:6px">اسم المتطوع (يُسجّل مع كل بادج)</label>
+      <label style="display:block;font-size:12px;color:#9AA4B2;margin-bottom:6px">Volunteer name (saved with each badge)</label>
       <div class="manual">
-        <input id="who" placeholder="اكتب اسمك">
-        <button id="whoBtn">حفظ</button>
+        <input id="who" placeholder="Enter your name">
+        <button id="whoBtn">Save</button>
       </div>
-      <div class="muted" id="whoMsg" style="text-align:right"></div>
+      <div class="muted" id="whoMsg" style="text-align:left"></div>
     </div>
 
-    <div class="stats">
-      <div class="stat"><b id="cntSession">0</b><span>استلموا (هذي الجلسة)</span></div>
-      <div class="stat"><b id="cntTotal">—</b><span>إجمالي استلموا</span></div>
+    <div class="card prog">
+      <div class="ptop"><b id="pCollected">—</b> of <span id="pTotal">—</span> badges collected</div>
+      <div class="bar"><div id="barFill" class="fill"></div></div>
+      <div class="pbot">Remaining <b id="pRemain">—</b> · This session <b id="cntSession">0</b></div>
+      <div class="cheer" id="cheer"></div>
     </div>
 
     <div class="result" id="result"></div>
 
     <div class="card">
       <div id="reader"></div>
-      <div class="muted" id="camMsg">وجّهي الكاميرا على الـ QR</div>
+      <div class="muted" id="camMsg">Point the camera at the QR</div>
     </div>
 
     <div class="card">
       <div class="manual">
-        <input id="manual" placeholder="أو اكتبي رقم التسجيل يدوياً">
-        <button id="manualBtn">تأكيد</button>
+        <input id="manual" placeholder="Or type the registration ID">
+        <button id="manualBtn">Confirm</button>
       </div>
     </div>
-
-    <button class="ghost" id="logout">تسجيل خروج</button>
   </div>
 
 </div>
@@ -100,42 +95,38 @@ async function api(path,opts={}){
   return fetch(CFG.URL+'/'+path,opts);
 }
 
-/* ---- login ---- */
-$('loginBtn').onclick=async()=>{
-  const email=$('email').value.trim(), pw=$('pass').value, e=$('loginErr'); e.textContent='';
-  if(!email||!pw){e.textContent='أدخلي الإيميل وكلمة السر';return;}
-  $('loginBtn').disabled=true;$('loginBtn').textContent='...';
-  try{
-    const r=await fetch(CFG.URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:CFG.ANON,'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
-    const d=await r.json(); if(!r.ok)throw new Error(d.error_description||d.msg||'فشل الدخول');
-    TOKEN=d.access_token;
-    $('loginCard').classList.add('hidden'); $('scanPane').classList.remove('hidden');
-    if(volunteer){ $('who').value=volunteer; $('whoMsg').textContent='✓ محفوظ: '+volunteer; }
-    refreshTotal(); startCam();
-  }catch(ex){e.textContent=String(ex.message).includes('Invalid')?'إيميل أو كلمة سر غير صحيحة':ex.message;}
-  finally{$('loginBtn').disabled=false;$('loginBtn').textContent='تسجيل الدخول';}
-};
-$('pass').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click();});
-
-$('logout').onclick=()=>{ try{if(window.__qr)window.__qr.stop();}catch(_){ } location.reload(); };
-
 /* ---- volunteer name ---- */
 try{ volunteer=localStorage.getItem('anmc_volunteer')||''; }catch(_){}
 function setWho(){
   volunteer=$('who').value.trim();
   try{ localStorage.setItem('anmc_volunteer',volunteer); }catch(_){}
-  $('whoMsg').textContent=volunteer?('✓ محفوظ: '+volunteer):'';
+  $('whoMsg').textContent=volunteer?('✓ Saved: '+volunteer):'';
 }
 $('whoBtn').onclick=setWho;
 $('who').addEventListener('keydown',e=>{if(e.key==='Enter')setWho();});
 
-/* ---- total collected count ---- */
+/* ---- progress (collected / total / remaining) ---- */
+let ST={total:0,collected:0};
+function renderStats(){
+  const t=ST.total||0, c=ST.collected||0, rem=Math.max(t-c,0);
+  $('pCollected').textContent=c; $('pTotal').textContent=t||'—'; $('pRemain').textContent=t?rem:'—';
+  const pct=t?Math.round(c/t*100):0;
+  $('barFill').style.width=pct+'%';
+  let msg='';
+  if(t){
+    if(c>=t) msg='🎉 All done! Great work, team 👏';
+    else if(pct>=90) msg='🔥 Only '+rem+' left — almost there!';
+    else if(pct>=75) msg='💪 Excellent! '+pct+'% done';
+    else if(pct>=50) msg='✨ Halfway there! Keep going';
+    else if(pct>=25) msg='👍 Great start — let’s keep going';
+  }
+  $('cheer').textContent=msg;
+}
 async function refreshTotal(){
   try{
-    const r=await api('rest/v1/'+CFG.TABLE+'?select=registrant_id&badge_collected=is.true',{headers:{'Prefer':'count=exact','Range':'0-0','Range-Unit':'items'}});
-    const cr=r.headers.get('content-range'); // e.g. 0-0/42
-    const total=cr&&cr.includes('/')?cr.split('/')[1]:'—';
-    $('cntTotal').textContent=total;
+    const r=await api('rest/v1/rpc/badge_stats',{method:'POST',body:'{}'});
+    const d=await r.json();
+    if(r.ok && d){ ST.total=d.total||0; ST.collected=d.collected||0; renderStats(); }
   }catch(_){}
 }
 
@@ -153,26 +144,26 @@ function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<
 
 async function collect(code){
   code=(code||'').trim(); if(!code||busy)return;
-  if(!volunteer){ showResult('r-already','✎','اكتب اسمك أول','','املأ خانة "اسم المتطوع" فوق ثم احفظ'); beep(false); return; }
+  if(!volunteer){ showResult('r-already','✎','Enter your name first','','Fill the "Volunteer name" field above and save'); beep(false); return; }
   // debounce same code within 3s
   const now=Date.now(); if(code===lastCode && now-lastAt<3000)return; lastCode=code;lastAt=now;
   busy=true;
   try{
     const r=await api('rest/v1/rpc/collect_badge',{method:'POST',body:JSON.stringify({p_code:code,p_by:volunteer})});
     const d=await r.json();
-    if(!r.ok) throw new Error(d.message||d.hint||'خطأ');
+    if(!r.ok) throw new Error(d.message||d.hint||'Error');
     if(d.status==='ok'){
       sessionCount++; $('cntSession').textContent=sessionCount;
-      $('cntTotal').textContent=(parseInt($('cntTotal').textContent)||0)+1;
-      showResult('r-ok','✓','تم تسليم البادج',d.id,d.name||''); beep(true);
+      ST.collected=(ST.collected||0)+1; renderStats();
+      showResult('r-ok','✓','Badge issued',d.id,d.name||''); beep(true);
     }else if(d.status==='already'){
       const when=d.at?new Date(d.at).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):'';
-      showResult('r-already','⚠',d.name||'','',(d.id?d.id+' · ':'')+'استلم مسبقاً'+(when?' — '+when:'')); beep(false);
+      showResult('r-already','⚠',d.name||'','',(d.id?d.id+' · ':'')+'Already collected'+(when?' — '+when:'')); beep(false);
     }else{
-      showResult('r-no','✕','غير موجود',code,'الرقم مو في القاعدة'); beep(false);
+      showResult('r-no','✕','Not found',code,'ID is not in the database'); beep(false);
     }
   }catch(ex){
-    showResult('r-no','✕','خطأ',code,String(ex.message)); beep(false);
+    showResult('r-no','✕','Error',code,String(ex.message)); beep(false);
   }finally{ busy=false; }
 }
 
@@ -185,8 +176,13 @@ function startCam(){
   q.start({facingMode:"environment"},{fps:10,qrbox:{width:230,height:230}},
     txt=>collect(txt),
     ()=>{}
-  ).then(()=>{$('camMsg').textContent='جاهز — وجّهي الكاميرا على الـ QR';})
-   .catch(e=>{$('camMsg').textContent='تعذّر فتح الكاميرا (افتحي الصفحة من رابط HTTPS). تقدرين تستخدمين الإدخال اليدوي.';});
+  ).then(()=>{$('camMsg').textContent='Ready — point the camera at the QR';})
+   .catch(e=>{$('camMsg').textContent='Could not open the camera (open the page over HTTPS). You can use manual entry.';});
 }
+
+/* ---- auto start (no login) ---- */
+if(volunteer){ $('who').value=volunteer; $('whoMsg').textContent='✓ Saved: '+volunteer; }
+refreshTotal();
+startCam();
 </script>
 </body></html>

@@ -1,607 +1,138 @@
-<!DOCTYPE html>
-<html lang="en" dir="ltr">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#12151A" />
-<title>Attendance Scanner — ANMC 2026</title>
-
-<!--
-  ============================================================
-   ANMC 2026 — ماسح حضور المشاركين (PWA) مع تسجيل دخول للمتطوعين
-  ============================================================
-
-  خطوات التشغيل:
-  1) عبّي CONFIG بالأسفل (رابط Supabase + المفتاح العام anon).
-  2) شغّل SQL التالي مرة واحدة في Supabase (SQL Editor):
-
-     -- (أ) جدول الحضور
-     create table if not exists public.attendance (
-       id             bigint generated always as identity primary key,
-       registrant_code text not null,
-       registrant_name text,
-       check_in       timestamptz not null default now(),
-       check_out      timestamptz,
-       cpd_hours      numeric,
-       scanned_by       uuid  default auth.uid(),   -- معرّف المتطوع الذي سجّل
-       scanned_by_email text  default auth.email(), -- إيميل المتطوع الذي سجّل
-       created_at     timestamptz not null default now()
-     );
-     create index if not exists idx_attendance_open
-       on public.attendance (registrant_code) where check_out is null;
-
-     -- (ب) جدول ربط المسؤول بمتطوعيه
-     create table if not exists public.supervisors (
-       supervisor_email text not null,   -- إيميل المسؤول
-       volunteer_email  text not null,   -- إيميل المتطوع التابع له
-       primary key (supervisor_email, volunteer_email)
-     );
-
-     -- (ج) الحماية بـ RLS
-     alter table public.attendance  enable row level security;
-     alter table public.supervisors enable row level security;
-
-     -- كل متطوع مسجّل يستطيع الكتابة (تسجيل حضور)
-     create policy "att_insert" on public.attendance
-       for insert to authenticated with check (true);
-     create policy "att_update" on public.attendance
-       for update to authenticated using (true);
-
-     -- القراءة: المتطوع يرى ما سجّله هو،
-     -- والمسؤول يرى ما سجّله متطوعوه فقط (فلترة على مستوى القاعدة)
-     create policy "att_read" on public.attendance
-       for select to authenticated using (
-         scanned_by_email = auth.email()
-         or exists (
-           select 1 from public.supervisors sv
-           where sv.supervisor_email = auth.email()
-             and sv.volunteer_email  = attendance.scanned_by_email
-         )
-       );
-
-     -- المسؤول يقرأ صفوف الربط الخاصة به فقط
-     create policy "sv_read" on public.supervisors
-       for select to authenticated using ( supervisor_email = auth.email() );
-
-     -- لم نُنشئ سياسة حذف على أي جدول، فالحذف ممنوع على الجميع.
-
-     -- (اختياري) قراءة جدول التسجيل من متطوع مسجّل:
-     -- alter table public.registrations enable row level security;
-     -- create policy "reg_read" on public.registrations
-     --   for select to authenticated using (true);
-
-  3) أنشئ حسابات المتطوعين والمسؤولين في Supabase:
-     Authentication ← Users ← Add user (إيميل حقيقي + كلمة سر لكل شخص).
-     وأغلق التسجيل الذاتي: Authentication ← Providers ← Email ←
-     عطّل "Enable sign-ups".
-
-  4) اربط كل مسؤول بمتطوعيه في جدول supervisors، مثال:
-     insert into public.supervisors (supervisor_email, volunteer_email) values
-       ('safa@hamad.qa', 'ahmad@hamad.qa'),
-       ('safa@hamad.qa', 'sara@hamad.qa');
-     (المسؤول يرى فقط حركات المتطوعين المدرجين تحت إيميله.)
-
-  5) ارفع الملف على استضافة HTTPS وأرسل الرابط.
-  ============================================================
--->
-
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANMC 2026 — Badge Desk Sign-up</title>
 <style>
-  :root{
-    --bg:#12151A; --surface:#1B1F27; --surface-2:#232833;
-    --line:#2E3440; --text:#EEF1F5; --muted:#9AA4B2;
-    --maroon:#8A1538; --maroon-soft:#B23A5B;
-    --in:#2FBF71; --out:#E0A82E; --err:#E5484D;
-    --radius:18px;
-  }
-  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
-  html,body{margin:0;height:100%;}
-  body{
-    background:var(--bg); color:var(--text);
-    font-family:"Cairo","Segoe UI","Noto Sans Arabic",system-ui,sans-serif;
-    display:flex; flex-direction:column; min-height:100dvh;
-    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-  }
-  header{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);}
-  .brand{width:40px;height:40px;border-radius:11px;flex:none;
-    background:linear-gradient(150deg,var(--maroon),var(--maroon-soft));
-    display:grid;place-items:center;font-weight:800;font-size:15px;letter-spacing:-.5px;}
-  header .htxt{flex:1;}
-  header h1{font-size:16px;margin:0;font-weight:700;line-height:1.2;}
-  header p{margin:2px 0 0;font-size:12px;color:var(--muted);}
-  .who{font-size:11px;color:var(--muted);text-align:left;}
-  .who button{background:none;border:none;color:var(--maroon-soft);font:inherit;font-size:11px;cursor:pointer;padding:2px 0 0;text-decoration:underline;}
-  #exportBtn{display:block;margin-bottom:2px;color:var(--in);font-weight:700;}
-
-  main{flex:1;display:flex;flex-direction:column;gap:16px;padding:16px;max-width:520px;margin:0 auto;width:100%;}
-
-  /* شاشة تسجيل الدخول */
-  .login{max-width:400px;margin:auto;width:100%;padding:24px;text-align:center;}
-  .login .brand{margin:0 auto 18px;width:56px;height:56px;border-radius:16px;font-size:19px;}
-  .login h2{margin:0 0 6px;font-size:20px;}
-  .login p{margin:0 0 22px;color:var(--muted);font-size:13px;}
-  .field{margin-bottom:12px;text-align:right;}
-  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;}
-  .field input{width:100%;background:var(--surface);border:1px solid var(--line);color:var(--text);
-    border-radius:12px;padding:14px;font:inherit;font-size:15px;}
-  .field input:focus{outline:none;border-color:var(--maroon-soft);}
-  .loginErr{color:var(--err);font-size:13px;min-height:18px;margin:4px 0 12px;}
-
-  .scanner{position:relative;border-radius:var(--radius);overflow:hidden;background:#000;border:1px solid var(--line);aspect-ratio:1/1;}
-  #reader{width:100%;height:100%;}
-  #reader video{width:100%!important;height:100%!important;object-fit:cover;}
-  .frame{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 0 3px rgba(255,255,255,.12);}
-  .frame::before{content:"";position:absolute;inset:18%;border-radius:14px;box-shadow:inset 0 0 0 2px rgba(255,255,255,.55);}
-  .scanner .hint{position:absolute;left:0;right:0;bottom:0;padding:10px;text-align:center;font-size:13px;color:#cfd6df;background:linear-gradient(transparent,rgba(0,0,0,.65));}
-  .start{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:26px;background:var(--surface);}
-  .start p{color:var(--muted);font-size:14px;margin:14px 0 0;}
-  .start .btn{max-width:260px;}
-
-  .result{border-radius:var(--radius);padding:20px;border:1px solid var(--line);background:var(--surface);
-    text-align:center;transition:.15s;min-height:118px;display:flex;flex-direction:column;justify-content:center;gap:6px;}
-  .result.in{background:rgba(47,191,113,.13);border-color:var(--in);}
-  .result.out{background:rgba(224,168,46,.13);border-color:var(--out);}
-  .result.err{background:rgba(229,72,77,.13);border-color:var(--err);}
-  .result .tag{font-size:13px;font-weight:700;letter-spacing:.3px;}
-  .result.in .tag{color:var(--in);} .result.out .tag{color:var(--out);} .result.err .tag{color:var(--err);}
-  .result .name{font-size:22px;font-weight:800;}
-  .result .meta{font-size:13px;color:var(--muted);}
-  .result .idle{color:var(--muted);font-size:15px;}
-
-  .btn{border:none;border-radius:14px;padding:15px 18px;font:inherit;font-weight:700;font-size:16px;cursor:pointer;width:100%;color:#fff;
-    background:linear-gradient(150deg,var(--maroon),var(--maroon-soft));}
-  .btn.ghost{background:var(--surface-2);color:var(--text);border:1px solid var(--line);}
-  .btn:active{transform:scale(.98);}
-  .btn:disabled{opacity:.55;}
-
-  .stats{display:flex;gap:10px;}
-  .stat{flex:1;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:12px;text-align:center;}
-  .stat b{display:block;font-size:22px;font-weight:800;}
-  .stat span{font-size:12px;color:var(--muted);}
-
-  .manual{display:flex;gap:8px;}
-  .manual input{flex:1;background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:12px;padding:13px;font:inherit;font-size:15px;text-align:right;}
-  .manual input::placeholder{color:var(--muted);}
-  .manual button{flex:none;width:auto;padding:0 18px;}
-
-  .log{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden;}
-  .log h2{margin:0;padding:12px 14px;font-size:13px;color:var(--muted);border-bottom:1px solid var(--line);font-weight:700;}
-  .log ul{margin:0;padding:0;list-style:none;max-height:230px;overflow:auto;}
-  .log li{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line);font-size:14px;}
-  .log li:last-child{border-bottom:none;}
-  .log .dot{width:9px;height:9px;border-radius:50%;flex:none;}
-  .log .l-in{background:var(--in);} .log .l-out{background:var(--out);}
-  .log .l-name{flex:1;font-weight:600;}
-  .log .l-time{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;}
-  .log .empty{padding:16px 14px;color:var(--muted);font-size:13px;text-align:center;}
-
-  .cfgwarn{background:rgba(229,72,77,.1);border:1px solid var(--err);color:#ffd7d8;border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.6;}
-  footer{padding:10px 16px 18px;text-align:center;color:var(--muted);font-size:11px;}
-  .hidden{display:none!important;}
-</style>
-</head>
+  :root{--navy:#12356b;--blue:#1766b3;--teal:#2aa0c6;--ok:#2a9d55;--line:#e3ecf6;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI",system-ui,Arial,sans-serif;background:#eef4fb;color:#13233f}
+  header{background:linear-gradient(135deg,var(--blue),var(--teal));color:#fff;padding:18px 16px;text-align:center}
+  header h1{margin:0;font-size:18px;font-weight:800}
+  header p{margin:5px 0 0;font-size:13px;opacity:.95}
+  .wrap{max-width:620px;margin:0 auto;padding:16px}
+  .intro{font-size:13px;color:#5a7098;text-align:center;margin:4px 0 16px}
+  .day{background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:16px;box-shadow:0 6px 18px rgba(20,60,120,.06)}
+  .day h2{margin:0 0 2px;font-size:16px;color:var(--navy)}
+  .day .time{font-size:12px;color:#7088a8;margin-bottom:10px}
+  .day .left{float:left;font-size:12px;color:var(--ok);font-weight:700}
+  .tbl{padding:10px 0;border-top:1px dashed var(--line)}
+  .tbl .no{font-weight:800;color:var(--navy);font-size:14px;margin-bottom:7px}
+  .tbl .no small{display:block;font-weight:600;color:#7088a8;font-size:11.5px;margin-top:1px}
+  .seats{display:flex;gap:8px;flex-wrap:wrap}
+  .seat{flex:1;min-width:130px;border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:13.5px;display:flex;align-items:center;justify-content:space-between;gap:8px;background:#fafcff}
+  .seat.filled{background:#eaf7ef;border-color:#bfe6cd}
+  .seat .nm{font-weight:700;color:#13233f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .seat .add{color:var(--blue);font-weight:700;cursor:pointer;width:100%;text-align:center}
+  .seat .x{color:#c0392b;cursor:pointer;font-weight:800;flex:none;padding:0 2px}
+  .muted{font-size:11px;color:#9bb0cc}
+  #status{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);background:#12356b;color:#fff;padding:9px 16px;border-radius:999px;font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
+  #status.show{opacity:1}
+  .reload{display:block;margin:0 auto 18px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px 16px;color:var(--blue);font-weight:700;cursor:pointer}
+</style></head>
 <body>
-  <!-- ترويسة تظهر بعد الدخول -->
-  <header id="appHeader" class="hidden">
-    <div class="brand">ANMC</div>
-    <div class="htxt">
-      <h1>Attendance Scanner</h1>
-      <p>6th Arab Nursing &amp; Midwifery Conference 2026</p>
-    </div>
-    <div class="who">
-      <div id="whoEmail"></div>
-      <button id="exportBtn" class="hidden">Export Excel</button>
-      <button id="fullReportBtn" class="hidden">Full Report</button>
-      <button id="logoutBtn">Sign out</button>
-    </div>
-  </header>
+<header>
+  <h1>ANMC 2026 · Badge Desk Sign-up</h1>
+  <p>6th Arab Nurses &amp; Midwives Conference</p>
+</header>
 
-  <!-- شاشة تسجيل الدخول -->
-  <div class="login" id="loginPane">
-    <div class="brand">ANMC</div>
-    <h2>Volunteer sign-in</h2>
-    <p>Sign in with your email to start scanning</p>
-    <div id="cfgWarn" class="cfgwarn hidden" style="margin-bottom:16px">
-      Supabase is not configured yet. Open the file and fill in <b>SUPABASE_URL</b> and <b>SUPABASE_ANON_KEY</b> in CONFIG.
-    </div>
-    <div class="field"><label>Email</label>
-      <input id="email" type="email" autocomplete="username" inputmode="email" autocapitalize="none" spellcheck="false" placeholder="you@example.com" /></div>
-    <div class="field"><label>Password</label>
-      <input id="password" type="password" autocomplete="current-password" placeholder="••••••••" /></div>
-    <div class="loginErr" id="loginErr"></div>
-    <button class="btn" id="loginBtn">Sign in</button>
-  </div>
+<div class="wrap">
+  <div class="intro">Pick a day that suits you and add your name to an empty seat. 10 volunteers per day · volunteer hours 10:00 AM – 5:00 PM (participant pickup 11:00 AM – 4:00 PM).</div>
+  <button class="reload" id="reload">↻ Refresh</button>
+  <div id="days"></div>
+  <div class="muted" style="text-align:center;margin:6px 0 26px">Tap ✕ next to your name to release a seat if your plans change.</div>
+</div>
+<div id="status"></div>
 
-  <!-- التطبيق -->
-  <main id="app" class="hidden">
-    <div class="scanner" id="scannerBox">
-      <div id="reader"></div>
-      <div class="frame hidden" id="frame"></div>
-      <div class="hint hidden" id="hint">Point the camera at the participant’s QR code</div>
-      <div class="start" id="startPane">
-        <button class="btn" id="startBtn">Start camera</button>
-        <p>Allow camera access when the browser asks</p>
-      </div>
-    </div>
-
-    <div class="result" id="result"><span class="idle">Waiting for scan…</span></div>
-
-    <div class="stats">
-      <div class="stat"><b id="stIn">0</b><span>Currently in hall</span></div>
-      <div class="stat"><b id="stTotal">0</b><span>Total scans today</span></div>
-    </div>
-
-    <div class="manual">
-      <input id="manualCode" placeholder="Enter ID manually (ANMC2026-0001)" />
-      <button class="btn" id="manualBtn">Submit</button>
-    </div>
-
-    <div class="log">
-      <h2>Recent activity</h2>
-      <ul id="logList"><li class="empty">No activity yet</li></ul>
-    </div>
-  </main>
-
-  <footer>CPD points are calculated automatically from actual attendance time (hours)</footer>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
-/* ======================= CONFIG ======================= */
-const CONFIG = {
-  SUPABASE_URL:      "https://xmdkvxzflbbdnkwsggjm.supabase.co",
-  SUPABASE_ANON_KEY: "sb_publishable_5UXQ_sYU5KOnRob11-ic1g_VtjUhXP8",
-
-  ATTENDANCE_TABLE:  "attendance",
-  REG_TABLE:         "registrations",
-  REG_CODE_COL:      "registrant_id",
-  REG_NAME_COL:      "full_name",
-
-  RESCAN_LOCK_MS:    4000
+const CFG={
+  URL:"https://xmdkvxzflbbdnkwsggjm.supabase.co",
+  ANON:"sb_publishable_5UXQ_sYU5KOnRob11-ic1g_VtjUhXP8",
+  T:"badge_desk_signups"
 };
-/* ====================================================== */
+const DAYS=[
+  {d:"2026-11-14",label:"Saturday · 14 Nov 2026"},
+  {d:"2026-11-15",label:"Sunday · 15 Nov 2026"},
+  {d:"2026-11-16",label:"Monday · 16 Nov 2026"}
+];
+const STATIONS=[
+  {no:1, label:"🟦 Table 1 · Pickup A–H", note:"2 staff", seats:2},
+  {no:2, label:"🟦 Table 2 · Pickup I–Q", note:"2 staff", seats:2},
+  {no:3, label:"🟦 Table 3 · Pickup R–Z", note:"2 staff + power", seats:2},
+  {no:4, label:"🖨 Table 4 · Printing & corrections", note:"2 staff + printer", seats:2},
+  {no:5, label:"⭐ Table 5 · VIP / Speakers / Guests / Members", note:"1 staff + power", seats:1},
+  {no:6, label:"🚪 Entrance · Greeter — directs by surname", note:"1 staff", seats:1}
+];
+const SEATS_PER_DAY=STATIONS.reduce((a,s)=>a+s.seats,0);
+const $=id=>document.getElementById(id);
+let rows=[];
 
-const S = {
-  configured: !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_ANON_KEY),
-  token:null, email:null,
-  scanning:false, lastCode:null, lastAt:0, busy:false, isSupervisor:false, isGlobalAdmin:false
-};
-const $ = id => document.getElementById(id);
-const nowStr = d => new Intl.DateTimeFormat('en-GB',{hour:'2-digit',minute:'2-digit',hour12:true}).format(d);
-const store = {
-  get:k=>{try{return JSON.parse(localStorage.getItem(k));}catch(_){return null;}},
-  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch(_){}},
-  del:k=>{try{localStorage.removeItem(k);}catch(_){}}
-};
+function H(path,opts={}){
+  opts.headers=Object.assign({apikey:CFG.ANON,Authorization:'Bearer '+CFG.ANON,'Content-Type':'application/json'},opts.headers||{});
+  return fetch(CFG.URL+'/rest/v1/'+path,opts);
+}
+function toast(msg){ const s=$('status'); s.textContent=msg; s.classList.add('show'); clearTimeout(window.__t); window.__t=setTimeout(()=>s.classList.remove('show'),1800); }
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function keyOf(day,t,seat){ return day+'|'+t+'|'+seat; }
 
-if(!S.configured){ $('cfgWarn').classList.remove('hidden'); }
+async function load(){
+  try{
+    const r=await H(CFG.T+'?select=id,day,table_no,seat,name&order=day,table_no,seat');
+    rows=r.ok?await r.json():[];
+  }catch(_){ rows=[]; }
+  render();
+}
 
-/* ---------- المصادقة ---------- */
-async function login(email,password){
-  const res = await fetch(`${CONFIG.SUPABASE_URL}/auth/v1/token?grant_type=password`,{
-    method:'POST',
-    headers:{apikey:CONFIG.SUPABASE_ANON_KEY,'Content-Type':'application/json'},
-    body:JSON.stringify({email,password})
+function render(){
+  const map={}; rows.forEach(x=>{ map[keyOf(x.day,x.table_no,x.seat)]=x; });
+  const host=$('days'); host.innerHTML='';
+  DAYS.forEach(day=>{
+    let filled=0;
+    const el=document.createElement('div'); el.className='day';
+    let html='<h2>'+day.label+'</h2><div class="time">Volunteer hours 10:00 AM – 5:00 PM · pickup 11:00 AM – 4:00 PM</div>';
+    let body='';
+    STATIONS.forEach(st=>{
+      let seatsHtml='';
+      for(let s=1;s<=st.seats;s++){
+        const rec=map[keyOf(day.d,st.no,s)];
+        if(rec){ filled++;
+          seatsHtml+='<div class="seat filled"><span class="nm">'+esc(rec.name)+'</span><span class="x" data-id="'+rec.id+'" data-name="'+esc(rec.name)+'">✕</span></div>';
+        }else{
+          seatsHtml+='<div class="seat"><span class="add" data-day="'+day.d+'" data-t="'+st.no+'" data-s="'+s+'">+ Add your name</span></div>';
+        }
+      }
+      body+='<div class="tbl"><div class="no">'+st.label+'<small>'+st.note+'</small></div><div class="seats">'+seatsHtml+'</div></div>';
+    });
+    const remaining=SEATS_PER_DAY-filled;
+    html='<div class="left">'+remaining+' seat'+(remaining===1?'':'s')+' left</div>'+html+body;
+    el.innerHTML=html; host.appendChild(el);
   });
-  const data = await res.json();
-  if(!res.ok) throw new Error(data.error_description||data.msg||'Sign-in failed');
-  return data; // access_token, refresh_token, user
+  // wire
+  host.querySelectorAll('.add').forEach(b=>b.onclick=onAdd);
+  host.querySelectorAll('.x').forEach(b=>b.onclick=onRemove);
 }
-function setSession(sess){
-  S.token = sess.access_token;
-  S.email = sess.user?.email || sess.email || '';
-  store.set('anmc_sess',{access_token:S.token, email:S.email});
-  enterApp();
-}
-function logout(){
-  if(S.scanning && qr){ qr.stop().catch(()=>{}); S.scanning=false; }
-  S.token=null; S.email=null; store.del('anmc_sess');
-  $('app').classList.add('hidden'); $('appHeader').classList.add('hidden');
-  $('loginPane').classList.remove('hidden');
-  $('password').value='';
-}
-function enterApp(){
-  $('loginPane').classList.add('hidden');
-  $('app').classList.remove('hidden'); $('appHeader').classList.remove('hidden');
-  $('whoEmail').textContent = S.email;
-  refreshStats();
-  checkSupervisor();
-}
-async function checkSupervisor(){
+
+async function onAdd(e){
+  const b=e.currentTarget;
+  const name=(prompt('Enter your name:')||'').trim();
+  if(!name) return;
+  const payload={day:b.dataset.day,table_no:+b.dataset.t,seat:+b.dataset.s,name:name};
   try{
-    const rows=await sb(`supervisors?supervisor_email=eq.${encodeURIComponent(S.email)}&select=volunteer_email`);
-    S.isSupervisor = rows.length>0;
-    $('exportBtn').classList.toggle('hidden', !S.isSupervisor);
-  }catch(e){ console.warn('checkSupervisor',e); }
-  // المسؤول العام فقط يشوف زر التقرير الكامل
+    const r=await H(CFG.T,{method:'POST',headers:{'Prefer':'return=representation'},body:JSON.stringify(payload)});
+    if(r.status===409){ toast('That seat was just taken — refreshing'); return load(); }
+    if(!r.ok) throw new Error(await r.text());
+    toast('Added ✓'); load();
+  }catch(ex){ toast('Error — try again'); load(); }
+}
+async function onRemove(e){
+  const b=e.currentTarget;
+  if(!confirm('Release this seat for '+b.dataset.name+'?')) return;
   try{
-    const ga=await sb(`global_admins?email=eq.${encodeURIComponent(S.email)}&select=email`);
-    S.isGlobalAdmin = ga.length>0;
-    $('fullReportBtn').classList.toggle('hidden', !S.isGlobalAdmin);
-  }catch(e){ console.warn('checkGlobalAdmin',e); }
+    const r=await H(CFG.T+'?id=eq.'+b.dataset.id,{method:'DELETE'});
+    if(!r.ok) throw new Error(await r.text());
+    toast('Seat released'); load();
+  }catch(ex){ toast('Error — try again'); load(); }
 }
-
-/* ---------- Supabase REST (بتوكن المتطوع) ---------- */
-async function sb(path, opts={}){
-  const res = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/${path}`,{
-    ...opts,
-    headers:{
-      apikey:CONFIG.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${S.token}`,
-      'Content-Type':'application/json',
-      ...(opts.headers||{})
-    }
-  });
-  if(res.status===401){ logout(); throw new Error('Session expired, please sign in again'); }
-  if(!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
-  const txt = await res.text();
-  return txt?JSON.parse(txt):[];
-}
-async function lookupName(code){
-  try{
-    const rows=await sb(`${CONFIG.REG_TABLE}?${CONFIG.REG_CODE_COL}=eq.${encodeURIComponent(code)}&select=${CONFIG.REG_NAME_COL}&limit=1`);
-    return (rows[0]&&rows[0][CONFIG.REG_NAME_COL])||null;
-  }catch(e){console.warn('lookupName',e);return null;}
-}
-async function getOpenSession(code){
-  const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}?registrant_code=eq.${encodeURIComponent(code)}&check_out=is.null&select=*&order=check_in.desc&limit=1`);
-  return rows[0];
-}
-async function insertCheckIn(code,name){
-  const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}`,{method:'POST',headers:{Prefer:'return=representation'},
-    body:JSON.stringify({registrant_code:code,registrant_name:name,scanned_in_by_email:S.email})});
-  return rows[0];
-}
-async function closeCheckOut(id,checkInISO){
-  const outT=new Date(), hours=+(((outT-new Date(checkInISO))/3600000).toFixed(3));
-  await sb(`${CONFIG.ATTENDANCE_TABLE}?id=eq.${id}`,{method:'PATCH',
-    body:JSON.stringify({check_out:outT.toISOString(),cpd_hours:hours,scanned_out_by_email:S.email})});
-  return {outT,hours};
-}
-
-/* ---------- منطق المسح ---------- */
-function parseCode(text){
-  const t=(text||'').trim();
-  const m=t.match(/ANMC\s*2026\s*-?\s*\d{1,6}/i);
-  if(m) return m[0].replace(/\s+/g,'').toUpperCase();
-  try{const j=JSON.parse(t);if(j.id||j.code)return String(j.id||j.code);}catch(_){}
-  return t;
-}
-async function handleCode(raw){
-  const code=parseCode(raw), t=Date.now();
-  if(code===S.lastCode && (t-S.lastAt)<CONFIG.RESCAN_LOCK_MS) return;
-  if(S.busy) return;
-  S.lastCode=code; S.lastAt=t; S.busy=true;
-  try{
-    // الدالة تقرّر دخول/خروج بناءً على آخر حركة للمشارك نفسه (تتجاوز RLS)
-    const name=await lookupName(code)||code;
-    const res=await sb('rpc/scan_attendance',{method:'POST',
-      headers:{'Content-Type':'application/json',Prefer:'return=representation'},
-      body:JSON.stringify({p_code:code,p_name:name})});
-    const r=Array.isArray(res)?res[0]:res;
-    if(r && r.error){ throw new Error(r.error); }
-    if(r && r.action==='in'){
-      showResult('in', r.name||name, code, new Date(r.check_in||Date.now()));
-    }else if(r && r.action==='out'){
-      showResult('out', r.name||code, code, new Date(r.check_out||Date.now()), r.hours);
-    }else{
-      throw new Error('unexpected response');
-    }
-    refreshStats(); beep();
-  }catch(e){
-    console.error(e); showResult('err','Could not record',code,new Date());
-  }finally{ setTimeout(()=>{S.busy=false;},700); }
-}
-
-/* ---------- الواجهة ---------- */
-function showResult(kind,name,code,when,hours=null){
-  const r=$('result'); r.className='result '+kind;
-  const tags={in:'Checked in',out:'Checked out',err:'Error'};
-  let meta=`${code} · ${nowStr(when)}`;
-  if(kind==='out'&&hours!=null) meta+=` · ${hours} h`;
-  r.innerHTML=`<span class="tag">${tags[kind]}</span>
-    <span class="name">${escapeHtml(name)}</span>
-    <span class="meta">${escapeHtml(meta)}</span>`;
-  if(kind!=='err') addLog(kind,name,when);
-  if(navigator.vibrate) navigator.vibrate(kind==='err'?[80,40,80]:60);
-}
-function addLog(kind,name,when){
-  const list=$('logList'); const e=list.querySelector('.empty'); if(e)e.remove();
-  const li=document.createElement('li');
-  li.innerHTML=`<span class="dot l-${kind}"></span>
-    <span class="l-name">${escapeHtml(name)}</span>
-    <span class="l-time">${kind==='in'?'In':'Out'} · ${nowStr(when)}</span>`;
-  list.prepend(li);
-  while(list.children.length>30) list.lastChild.remove();
-}
-async function refreshStats(){
-  try{
-    const open=await sb(`${CONFIG.ATTENDANCE_TABLE}?check_out=is.null&select=id`);
-    const start=new Date(); start.setHours(0,0,0,0);
-    const today=await sb(`${CONFIG.ATTENDANCE_TABLE}?created_at=gte.${start.toISOString()}&select=id`);
-    $('stIn').textContent=open.length||0; $('stTotal').textContent=today.length||0;
-  }catch(e){console.warn(e);}
-}
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-
-let AC;
-function beep(){try{AC=AC||new (window.AudioContext||window.webkitAudioContext)();
-  const o=AC.createOscillator(),g=AC.createGain();o.frequency.value=880;o.connect(g);g.connect(AC.destination);
-  g.gain.setValueAtTime(.001,AC.currentTime);g.gain.exponentialRampToValueAtTime(.2,AC.currentTime+.01);
-  g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+.18);o.start();o.stop(AC.currentTime+.2);}catch(_){}}
-
-/* ---------- الكاميرا ---------- */
-let qr;
-async function startCamera(){
-  if(S.scanning) return;
-  $('startPane').classList.add('hidden');
-  $('frame').classList.remove('hidden'); $('hint').classList.remove('hidden');
-  qr=new Html5Qrcode("reader",{verbose:false});
-  try{
-    await qr.start({facingMode:"environment"},{fps:10,qrbox:{width:230,height:230},aspectRatio:1},
-      txt=>handleCode(txt),()=>{});
-    S.scanning=true;
-  }catch(e){
-    $('startPane').classList.remove('hidden');
-    $('frame').classList.add('hidden'); $('hint').classList.add('hidden');
-    showResult('err','Camera failed to start','—',new Date());
-  }
-}
-
-/* ---------- ربط الأحداث ---------- */
-$('loginBtn').addEventListener('click', async ()=>{
-  const email=$('email').value.trim().toLowerCase(), pw=$('password').value;
-  const err=$('loginErr'); err.textContent='';
-  if(!S.configured){ err.textContent='Supabase is not configured in this file.'; return; }
-  if(!email||!pw){ err.textContent='Enter your email and password.'; return; }
-  $('loginBtn').disabled=true; $('loginBtn').textContent='Signing in…';
-  try{ const sess=await login(email,pw); setSession(sess); }
-  catch(e){ err.textContent = e.message.includes('Invalid')?'Invalid email or password':e.message; }
-  finally{ $('loginBtn').disabled=false; $('loginBtn').textContent='Sign in'; }
-});
-$('password').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click();});
-$('logoutBtn').addEventListener('click', logout);
-$('exportBtn').addEventListener('click', exportExcel);
-
-async function exportExcel(){
-  const btn=$('exportBtn'); const old=btn.textContent;
-  btn.textContent='Exporting…'; btn.disabled=true;
-  try{
-    // بفضل RLS، هذا الاستعلام يرجّع فقط حركات متطوّعي هذا المسؤول
-    const rows=await sb(`${CONFIG.ATTENDANCE_TABLE}?select=*&order=registrant_code,check_in`);
-    if(!rows.length){ alert('No activity for your volunteers yet.'); return; }
-    const data=rows.map(r=>({
-      'Checked in by': r.scanned_in_by_email||'',
-      'Checked out by': r.scanned_out_by_email||'',
-      'Participant ID': r.registrant_code||'',
-      'Participant name': r.registrant_name||'',
-      'Check-in': r.check_in?new Date(r.check_in).toLocaleString('en-GB'):'',
-      'Check-out': r.check_out?new Date(r.check_out).toLocaleString('en-GB'):'',
-      'CPD hours': r.cpd_hours??''
-    }));
-    const ws=XLSX.utils.json_to_sheet(data);
-    ws['!cols']=[{wch:26},{wch:16},{wch:24},{wch:22},{wch:22},{wch:10}];
-    const wb=XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb,ws,'Attendance');
-    const stamp=new Date().toISOString().slice(0,10);
-    XLSX.writeFile(wb,`ANMC2026-attendance-${stamp}.xlsx`);
-  }catch(e){
-    console.error(e); alert('Export failed: '+e.message);
-  }finally{ btn.textContent=old; btn.disabled=false; }
-}
-
-/* ---------- التقرير الكامل: Excel بـ6 شيتات بالفئة ---------- */
-$('fullReportBtn').addEventListener('click', fullReport);
-
-const CONF_TOTAL_HOURS = 25;   // إجمالي ساعات المؤتمر
-const FULL_POINTS       = 17;  // نقاط CPD الكاملة
-
-function roundHalf(x){ return Math.round(x*2)/2; }
-
-async function fetchAllPaged(pathBase){
-  // نسحب كل الصفوف على دفعات (تجاوز حد الصفوف الافتراضي)
-  const out=[]; const step=1000; let from=0;
-  while(true){
-    const rows=await sb(pathBase, {headers:{Range:`${from}-${from+step-1}`, 'Range-Unit':'items'}});
-    if(!rows.length) break;
-    out.push(...rows);
-    if(rows.length<step) break;
-    from+=step;
-  }
-  return out;
-}
-
-async function fullReport(){
-  const btn=$('fullReportBtn'); const old=btn.textContent;
-  btn.textContent='Building…'; btn.disabled=true;
-  try{
-    // 1) كل الحضور
-    const att=await fetchAllPaged(`${CONFIG.ATTENDANCE_TABLE}?select=registrant_code,registrant_name,check_in,check_out,cpd_hours&order=registrant_code,check_in`);
-    // 2) كل التسجيل (الفئة/QID/License/الإيميل/نوع الحضور)
-    const reg=await fetchAllPaged(`${CONFIG.REG_TABLE}?select=registrant_id,full_name,qid,licence_no,email,category,attendance_mode`);
-    if(!reg.length){ alert('No registrations found.'); return; }
-
-    // خريطة التسجيل بالمعرّف
-    const regMap={}; reg.forEach(r=> regMap[r.registrant_id]=r);
-
-    // 3) نجمّع حضور كل مشارك (إجمالي الساعات + أول دخول + آخر خروج)
-    const agg={}; // code -> {hours, firstIn, lastOut, name}
-    att.forEach(a=>{
-      const c=a.registrant_code; if(!c) return;
-      if(!agg[c]) agg[c]={hours:0, firstIn:null, lastOut:null, name:a.registrant_name||''};
-      const h=parseFloat(a.cpd_hours); if(!isNaN(h)) agg[c].hours+=h;
-      if(a.check_in){ const t=new Date(a.check_in); if(!agg[c].firstIn||t<agg[c].firstIn) agg[c].firstIn=t; }
-      if(a.check_out){ const t=new Date(a.check_out); if(!agg[c].lastOut||t>agg[c].lastOut) agg[c].lastOut=t; }
-    });
-
-    const fmt=d=> d? d.toLocaleString('en-GB'):'';
-
-    // 4) نبني صفوف لكل مشارك مسجّل، مع حضوره (لو موجود)
-    const CATS=['Participant','Speaker','Member','Guest','Complimentary'];
-    const buckets={}; CATS.forEach(c=>buckets[c]=[]); buckets['Online']=[];
-
-    reg.forEach(r=>{
-      const a=agg[r.registrant_id];
-      const hours=a? +a.hours.toFixed(3):0;
-      const licensed = r.licence_no && String(r.licence_no).trim()!=='';
-      const points = licensed && hours>0 ? roundHalf((hours/CONF_TOTAL_HOURS)*FULL_POINTS) : (licensed? 0 : '');
-      const row={
-        'Name': r.full_name||a?.name||'',
-        'QID': r.qid||'',
-        'License': licensed? r.licence_no : 'NA',
-        'Email': r.email||'',
-        'Check-in': a? fmt(a.firstIn):'',
-        'Check-out': a? fmt(a.lastOut):'',
-        'Total hours': hours||0,
-        'CPD points': points
-      };
-      // أونلاين → شيت Online ، غيره → شيت فئته
-      if(r.attendance_mode==='online') buckets['Online'].push(row);
-      else (buckets[r.category]||buckets['Participant']).push(row);
-    });
-
-    // 5) نبني الملف
-    const wb=XLSX.utils.book_new();
-    const cols=[{wch:26},{wch:14},{wch:14},{wch:26},{wch:20},{wch:20},{wch:11},{wch:11}];
-    const HEADERS=['Name','QID','License','Email','Check-in','Check-out','Total hours','CPD points'];
-    const order=['Participant','Speaker','Member','Guest','Complimentary','Online'];
-    order.forEach(cat=>{
-      const data=buckets[cat];
-      let ws;
-      if(data.length){ ws=XLSX.utils.json_to_sheet(data, {header:HEADERS}); }
-      else { ws=XLSX.utils.aoa_to_sheet([HEADERS]); }  // شيت فاضي بكل العناوين
-      ws['!cols']=cols;
-      XLSX.utils.book_append_sheet(wb, ws, cat);
-    });
-    const stamp=new Date().toISOString().slice(0,10);
-    XLSX.writeFile(wb,`ANMC2026-FULL-REPORT-${stamp}.xlsx`);
-  }catch(e){
-    console.error(e); alert('Full report failed: '+e.message);
-  }finally{ btn.textContent=old; btn.disabled=false; }
-}
-
-$('startBtn').addEventListener('click', startCamera);
-$('manualBtn').addEventListener('click', ()=>{const v=$('manualCode').value.trim();if(!v)return;handleCode(v);$('manualCode').value='';});
-$('manualCode').addEventListener('keydown',e=>{if(e.key==='Enter')$('manualBtn').click();});
-
-/* استعادة الجلسة إن وُجدت */
-(function restore(){
-  const s=store.get('anmc_sess');
-  if(s&&s.access_token){ S.token=s.access_token; S.email=s.email; enterApp(); }
-})();
-
-/* ---------- PWA ---------- */
-const manifest={name:"ANMC 2026 Attendance Scanner",short_name:"ANMC Scan",display:"standalone",
-  background_color:"#12151A",theme_color:"#12151A",orientation:"portrait",start_url:".",
-  icons:[{src:"data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(
-   `<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512'><rect width='512' height='512' rx='96' fill='#8A1538'/><text x='50%' y='55%' font-size='150' fill='#fff' text-anchor='middle' font-family='sans-serif' font-weight='800'>QR</text></svg>`))),
-   sizes:"512x512",type:"image/svg+xml",purpose:"any"}]};
-const ml=document.createElement('link'); ml.rel='manifest';
-ml.href=URL.createObjectURL(new Blob([JSON.stringify(manifest)],{type:'application/json'}));
-document.head.appendChild(ml);
-if('serviceWorker' in navigator && location.protocol==='https:'){
-  navigator.serviceWorker.register(URL.createObjectURL(new Blob(
-    [`self.addEventListener('fetch',()=>{});`],{type:'text/javascript'}))).catch(()=>{});
-}
+$('reload').onclick=load;
+load();
 </script>
-</body>
-</html>
+</body></html>
